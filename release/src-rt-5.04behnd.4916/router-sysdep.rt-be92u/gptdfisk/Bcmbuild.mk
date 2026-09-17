@@ -27,11 +27,10 @@ check_config: $(APP)/Makefile
 
 $(APP)/Makefile: configure
 
-configure: $(APP).tar.gz 
+configure: $(APP).tar.gz
 	(tar xkzf $(APP).tar.gz 2> /dev/null || true)
-	echo "Applying patches to $(APP)" ; \
-	patch -p1 -b -N -s -d$(APP) < $(APP).patch ; \
-	echo "gptfdisk is untarred"
+	@echo "Skipping obsolete legacy patch for $(APP); the bundled 1.0.9 source already contains the required fixes"
+	@echo "gptfdisk is untarred"
 
 clean:
 	rm -f $(INSTALL_DIR)/bin/$(BIN)
