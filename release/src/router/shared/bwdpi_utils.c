@@ -221,6 +221,52 @@ void tm_recycle_stuck_process()
 		}
 	}
 }
+#else
+/*
+ * Some prebuilt ASUS components reference the BWDPI helper API even when
+ * RTCONFIG_BWDPI is disabled.  Keep inert ABI-compatible entry points so a
+ * firmware without the Trend Micro engine can still link.  None of these
+ * stubs loads a DPI module or reports the engine as available.
+ */
+int check_wrs_switch(void)
+{
+	return 0;
+}
+
+int check_bwdpi_nvram_setting(void)
+{
+	return 0;
+}
+
+int check_tdts_module_exist(void)
+{
+	return 0;
+}
+
+int get_fw_mesh_extender(void **output, unsigned int *buf_used_len)
+{
+	if (output)
+		*output = NULL;
+	if (buf_used_len)
+		*buf_used_len = 0;
+	return -1;
+}
+
+int mesh_set_extender(char *macstr, unsigned char action)
+{
+	(void)macstr;
+	(void)action;
+	return -1;
+}
+
+int get_fw_user_list(void **output, unsigned int *used_len)
+{
+	if (output)
+		*output = NULL;
+	if (used_len)
+		*used_len = 0;
+	return -1;
+}
 #endif
 
 /*
