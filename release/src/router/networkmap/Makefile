@@ -202,6 +202,14 @@ all: $(EXEC)
 endif
 endif
 
+ifneq ($(RTCONFIG_BWDPI),y)
+BWDPI_COMPAT_SO = libbwdpi.so
+all: $(BWDPI_COMPAT_SO)
+
+$(BWDPI_COMPAT_SO): compat/bwdpi_compat.c
+	$(CC) -fPIC -shared -Wl,-soname,libbwdpi.so -o $@ $<
+endif
+
 $(EXEC): $(OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS) $(CFLAGS)
 
@@ -251,6 +259,10 @@ endif
 	cp -f db/nmp_bwdpi_type.js $(INSTALLDIR)/usr/networkmap/nmp_bwdpi_type.js
 	install -D api/$(NMP_API_SO) $(INSTALLDIR)/usr/lib/$(NMP_API_SO)
 	$(STRIP) $(INSTALLDIR)/usr/lib/*.so
+ifneq ($(RTCONFIG_BWDPI),y)
+	install -D $(BWDPI_COMPAT_SO) $(INSTALLDIR)/usr/lib/$(BWDPI_COMPAT_SO)
+	$(STRIP) $(INSTALLDIR)/usr/lib/$(BWDPI_COMPAT_SO)
+endif
 
 clean:
 ifneq ($(AC2900),y)
@@ -260,6 +272,9 @@ ifeq ($(RTCONFIG_AMAS),y)
 endif
 else
 	rm -rf *.o $(EXEC) *~
+endif
+ifneq ($(RTCONFIG_BWDPI),y)
+	rm -f $(BWDPI_COMPAT_SO)
 endif
 
 
