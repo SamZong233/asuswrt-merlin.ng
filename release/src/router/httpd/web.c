@@ -67,8 +67,11 @@
 #include <timezone.h>
 #include <nvram_config.h>
 
-#ifdef RTCONFIG_FANCTRL
+#if defined(RTCONFIG_FANCTRL) || defined(HND_ROUTER)
 #include <wlutils.h>
+#endif
+#ifdef HND_ROUTER
+extern sta_info_t *wl_sta_info(char *ifname, struct ether_addr *ea);
 #endif
 
 #ifdef RTCONFIG_NOTIFICATION_CENTER
@@ -10790,6 +10793,290 @@ static int get_client_detail_info(struct json_object *clients, struct json_objec
 	return 0;
 }
 
+/*
+ * BWDPI-free client-list fallback.  The closed networkmap binary can be
+ * unavailable when its DPI-only dependencies are disabled, but DHCP leases
+ * and the kernel ARP table still provide the basic client identity data the
+ * web UI needs.
+ */
+static void append_basic_client(struct json_object *clients,
+		struct json_object *macArray, const char *mac, const char *ip,
+		const char *name, const char *iface)
+{
+	struct json_object *client;
+	char fallback_name[128];
+	#define CLIENT_FIELD(k, v) json_object_object_add(client, k, json_object_new_string(v))
+	if (!mac || !*mac || !ip || !*ip || !strchr(mac, ':'))
+		return;
+	if (json_object_object_get_ex(clients, mac, &client))
+		return;
+	memset(fallback_name, 0, sizeof(fallback_name));
+	if (name && *name && strcmp(name, "*") && strcmp(name, "-"))
+		strlcpy(fallback_name, name, sizeof(fallback_name));
+	if (!*fallback_name)
+		strlcpy(fallback_name, mac, sizeof(fallback_name));
+	client = json_object_new_object();
+	CLIENT_FIELD("sdn_idx", "0"); CLIENT_FIELD("sdn_type", "DEFAULT");
+	CLIENT_FIELD("vlan_id", "0"); CLIENT_FIELD("mlo", "0");
+	CLIENT_FIELD("type", "0"); CLIENT_FIELD("defaultType", "0");
+	CLIENT_FIELD("name", fallback_name); CLIENT_FIELD("nickName", "");
+	CLIENT_FIELD("ip", ip); CLIENT_FIELD("ip6", "");
+	CLIENT_FIELD("ip6_prefix", ""); CLIENT_FIELD("mac", mac);
+	CLIENT_FIELD("from", "fallback"); CLIENT_FIELD("macRepeat", "1");
+	CLIENT_FIELD("isGateway", "0"); CLIENT_FIELD("isASUS", "0");
+	CLIENT_FIELD("isWebServer", "0"); CLIENT_FIELD("isPrinter", "0");
+	CLIENT_FIELD("isITunes", "0"); CLIENT_FIELD("isAiBoard", "0");
+	CLIENT_FIELD("dpiType", ""); CLIENT_FIELD("dpiDevice", "");
+	CLIENT_FIELD("vendor", ""); CLIENT_FIELD("isWL", "0");
+	CLIENT_FIELD("isGN", ""); CLIENT_FIELD("isOnline", "1");
+	CLIENT_FIELD("ssid", ""); CLIENT_FIELD("isLogin", "0");
+	CLIENT_FIELD("opMode", "0"); CLIENT_FIELD("rssi", "0");
+	CLIENT_FIELD("curTx", ""); CLIENT_FIELD("curRx", "");
+	CLIENT_FIELD("totalTx", ""); CLIENT_FIELD("totalRx", "");
+	CLIENT_FIELD("wlConnectTime", ""); CLIENT_FIELD("wlAuth", "");
+	CLIENT_FIELD("wlInterface", iface ? iface : "");
+	CLIENT_FIELD("ipMethod", "DHCP"); CLIENT_FIELD("group", "");
+	CLIENT_FIELD("callback", ""); CLIENT_FIELD("keeparp", "");
+	CLIENT_FIELD("qosLevel", ""); CLIENT_FIELD("wtfast", "0");
+	CLIENT_FIELD("internetMode", "allow"); CLIENT_FIELD("internetState", "1");
+	CLIENT_FIELD("ROG", "0"); CLIENT_FIELD("amesh_bind_mac", "");
+	CLIENT_FIELD("amesh_bind_band", "0");
+	json_object_object_add(clients, mac, client);
+	json_object_array_add(macArray, json_object_new_string(mac));
+	#undef CLIENT_FIELD
+}
+
+static void append_basic_clientlist(struct json_object *clients,
+		struct json_object *macArray)
+{
+	FILE *fp;
+	char line[512], lease[32], mac[32], ip[64], name[128], clientid[128];
+	const char *lease_files[] = { "/tmp/dnsmasq.leases",
+		"/var/lib/misc/dnsmasq.leases", NULL };
+	int i;
+	for (i = 0; lease_files[i]; ++i) {
+		fp = fopen(lease_files[i], "r");
+		if (!fp) continue;
+		while (fgets(line, sizeof(line), fp)) {
+			memset(lease, 0, sizeof(lease)); memset(mac, 0, sizeof(mac));
+			memset(ip, 0, sizeof(ip)); memset(name, 0, sizeof(name));
+			memset(clientid, 0, sizeof(clientid));
+			if (sscanf(line, "%31s %31s %63s %127s %127s", lease, mac, ip,
+				name, clientid) >= 3)
+				append_basic_client(clients, macArray, mac, ip, name, "br0");
+		}
+		fclose(fp);
+	}
+
+	/* ARP supplies statically addressed and currently active clients. */
+	fp = fopen("/proc/net/arp", "r");
+	if (fp) {
+		while (fgets(line, sizeof(line), fp)) {
+			char flags[16], mask[32], iface[32];
+			memset(ip, 0, sizeof(ip)); memset(flags, 0, sizeof(flags));
+			memset(mac, 0, sizeof(mac)); memset(mask, 0, sizeof(mask));
+			memset(iface, 0, sizeof(iface));
+			if (sscanf(line, "%63s %*s %15s %31s %31s %31s", ip, flags,
+				mac, mask, iface) == 5 && strcmp(mac, "00:00:00:00:00:00"))
+				append_basic_client(clients, macArray, mac, ip, "", iface);
+		}
+		fclose(fp);
+	}
+}
+
+#ifdef HND_ROUTER
+/*
+ * The closed networkmap worker is optional when BWDPI is disabled.  Keep the
+ * client-list fallback useful by asking the Broadcom wireless driver for its
+ * authenticated station list and station statistics directly.
+ */
+struct fallback_wireless_ctx {
+	struct json_object *clients;
+	struct json_object *macArray;
+};
+
+static void fallback_client_set_string(struct json_object *client,
+		const char *key, const char *value)
+{
+	json_object_object_add(client, key,
+		json_object_new_string(value ? value : ""));
+}
+
+static struct json_object *fallback_find_client(struct json_object *clients,
+		struct json_object *macArray, const char *mac)
+{
+	struct json_object *entry = NULL, *client = NULL;
+	size_t i, count;
+
+	if (json_object_object_get_ex(clients, mac, &client))
+		return client;
+
+	count = json_object_array_length(macArray);
+	for (i = 0; i < count; ++i) {
+		entry = json_object_array_get_idx(macArray, i);
+		if (!entry || !json_object_get_string(entry) ||
+			strcasecmp(json_object_get_string(entry), mac))
+			continue;
+		if (json_object_object_get_ex(clients,
+				json_object_get_string(entry), &client))
+			return client;
+	}
+
+	return NULL;
+}
+
+/* Convert a Broadcom radio unit to the index consumed by client_function.js. */
+static int fallback_wireless_index(int unit)
+{
+	char prefix[32];
+	int i, band, index = 0;
+	int five_g_count = 0, six_g_count = 0;
+
+	for (i = 0; i <= unit; ++i) {
+		snprintf(prefix, sizeof(prefix), "wl%d_", i);
+		band = nvram_pf_get_int(prefix, "nband");
+		if (band == 2)
+			index = 1;
+		else if (band == 1)
+			index = 2 + five_g_count++;
+		else if (band == 4)
+			index = 4 + six_g_count++;
+		else
+			index = 0;
+	}
+
+	return index;
+}
+
+static void fallback_update_wireless_client(struct fallback_wireless_ctx *ctx,
+		int unit, int subunit, const char *name_vif,
+		const struct ether_addr *ea, sta_info_t *sta)
+{
+	struct json_object *client;
+	char mac[ETHER_ADDR_STR_LEN];
+	char prefix[32], value[32];
+	char rssi[16], txrate[16], rxrate[16], conn_time[16];
+	int wireless_index;
+	int hours, minutes, seconds;
+	scb_val_t scb_val;
+
+	wireless_index = fallback_wireless_index(unit);
+	if (wireless_index <= 0)
+		return;
+
+	ether_etoa((const unsigned char *)ea, mac);
+	client = fallback_find_client(ctx->clients, ctx->macArray, mac);
+	if (!client)
+		return;
+
+	snprintf(prefix, sizeof(prefix), "wl%d_", unit);
+	if (subunit > 0)
+		snprintf(prefix, sizeof(prefix), "wl%d.%d_", unit, subunit);
+
+	snprintf(value, sizeof(value), "%d", wireless_index);
+	fallback_client_set_string(client, "isWL", value);
+	fallback_client_set_string(client, "ssid", nvram_pf_safe_get(prefix, "ssid"));
+	fallback_client_set_string(client, "wlInterface", name_vif);
+	fallback_client_set_string(client, "isOnline", "1");
+	if (subunit > 1) {
+		snprintf(value, sizeof(value), "%d", subunit - 1);
+		fallback_client_set_string(client, "isGN", value);
+	} else {
+		fallback_client_set_string(client, "isGN", "");
+	}
+
+	memset(rssi, 0, sizeof(rssi));
+	memset(txrate, 0, sizeof(txrate));
+	memset(rxrate, 0, sizeof(rxrate));
+	memset(conn_time, 0, sizeof(conn_time));
+	memset(&scb_val, 0, sizeof(scb_val));
+	memcpy(&scb_val.ea, ea, ETHER_ADDR_LEN);
+	if (!wl_ioctl((char *)name_vif, WLC_GET_RSSI, &scb_val,
+			sizeof(scb_val_t)))
+		snprintf(rssi, sizeof(rssi), "%d", scb_val.val);
+	else if (sta)
+		snprintf(rssi, sizeof(rssi), "%d", (int)sta->rssi[0]);
+	if (rssi[0])
+		fallback_client_set_string(client, "rssi", rssi);
+
+	if (!sta || !(sta->flags & WL_STA_SCBSTATS))
+		return;
+	if ((int)sta->tx_rate > 0)
+		snprintf(txrate, sizeof(txrate), "%u", sta->tx_rate / 1000);
+	if ((int)sta->rx_rate > 0)
+		snprintf(rxrate, sizeof(rxrate), "%u", sta->rx_rate / 1000);
+	if (txrate[0])
+		fallback_client_set_string(client, "curTx", txrate);
+	if (rxrate[0])
+		fallback_client_set_string(client, "curRx", rxrate);
+
+	hours = sta->in / 3600;
+	minutes = (sta->in % 3600) / 60;
+	seconds = sta->in % 60;
+	snprintf(conn_time, sizeof(conn_time), "%d:%02d:%02d",
+		hours, minutes, seconds);
+	fallback_client_set_string(client, "wlConnectTime", conn_time);
+}
+
+static int fallback_scan_wireless_interface(int idx, int unit, int subunit,
+		void *param)
+{
+	struct fallback_wireless_ctx *ctx = param;
+	struct maclist *auth;
+	sta_info_t *sta;
+	char prefix[32], name_vif[32], value[64];
+	int mac_list_size, i;
+
+	(void)idx;
+	snprintf(prefix, sizeof(prefix), "wl%d_", unit);
+	snprintf(name_vif, sizeof(name_vif), "wl%d", unit);
+	if (subunit > 0) {
+		snprintf(prefix, sizeof(prefix), "wl%d.%d_", unit, subunit);
+		snprintf(name_vif, sizeof(name_vif), "wl%d.%d", unit, subunit);
+	}
+
+	/* Virtual BSS interfaces do not always expose a separate *_mode key. */
+	if ((subunit == 0 &&
+		!nvram_match(strcat_r(prefix, "mode", value), "ap")) ||
+		(subunit > 0 &&
+		 (nvram_match(strcat_r(prefix, "mode", value), "sta") ||
+		  nvram_match(strcat_r(prefix, "mode", value), "wet") ||
+		  nvram_match(strcat_r(prefix, "mode", value), "psta"))) ||
+		nvram_match(strcat_r(prefix, "bss_enabled", value), "0"))
+		return 0;
+
+	mac_list_size = sizeof(auth->count) +
+		MAX_STA_COUNT * sizeof(struct ether_addr);
+	auth = calloc(1, mac_list_size);
+	if (!auth)
+		return 0;
+
+	strcpy((char *)auth, "authe_sta_list");
+	if (wl_ioctl(name_vif, WLC_GET_VAR, auth, mac_list_size)) {
+		free(auth);
+		return 0;
+	}
+
+	for (i = 0; i < auth->count && i < MAX_STA_COUNT; ++i) {
+		sta = wl_sta_info(name_vif, &auth->ea[i]);
+		fallback_update_wireless_client(ctx, unit, subunit,
+			name_vif, &auth->ea[i], sta);
+	}
+
+	free(auth);
+	return 0;
+}
+
+static void append_basic_wireless_client_info(struct json_object *clients,
+		struct json_object *macArray)
+{
+	struct fallback_wireless_ctx ctx;
+
+	ctx.clients = clients;
+	ctx.macArray = macArray;
+	foreach_wif(1, &ctx, fallback_scan_wireless_interface);
+}
+#endif /* HND_ROUTER */
 static int ej_get_clientlist(int eid, webs_t wp, int argc, char_t **argv)
 {
 
@@ -10812,17 +11099,19 @@ static int ej_get_clientlist(int eid, webs_t wp, int argc, char_t **argv)
 	if((nvram_match("refresh_networkmap", "1") || nvram_match("rescan_networkmap", "1")) && (check_if_file_exist(NMP_CACHE_FILE)))
 	{
 		clients = json_object_from_file(NMP_CACHE_FILE);
+#ifdef HND_ROUTER
+		if (clients) {
+			struct json_object *cachedMacArray = NULL;
+			if (json_object_object_get_ex(clients, "maclist", &cachedMacArray))
+				append_basic_wireless_client_info(clients, cachedMacArray);
+		}
+#endif
 		websWrite(wp, "%s", json_object_to_json_string(clients));
 		if(clients)
 			json_object_put(clients);	
 		return 0;
 	}
 	
-	if(!pids("networkmap")){
-		websWrite(wp, "{\"maclist\": [], \"ClientAPILevel\":\"%s\"}", CLIENTAPILEVEL);
-		return 0;
-	}
-
 	clients = json_object_new_object();
 
 	struct json_object *macArray = json_object_new_array();
@@ -10841,6 +11130,14 @@ static int ej_get_clientlist(int eid, webs_t wp, int argc, char_t **argv)
 	1012	CAPTIVE PORTAL
 	*/
 	get_client_detail_info(clients, macArray, SHMKEY_LAN);
+
+	if (json_object_array_length(macArray) == 0)
+		append_basic_clientlist(clients, macArray);
+#ifdef HND_ROUTER
+	/* Enrich both the DHCP/ARP fallback and any partial networkmap result. */
+	if (json_object_array_length(macArray) > 0)
+		append_basic_wireless_client_info(clients, macArray);
+#endif
 
 #if defined(RTCONFIG_TAGGED_BASED_VLAN) && !defined(FLAG_FUNCTION_TEMPORARILY_CANCELED)
 	int i, vlan_flag;
