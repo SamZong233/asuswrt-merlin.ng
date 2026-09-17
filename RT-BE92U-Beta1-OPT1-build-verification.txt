@@ -1,0 +1,22 @@
+RT-BE92U Beta1-OPT1 build verification
+=======================================
+
+Result: SUCCESS (make rt-be92u exit code 0)
+Build started (UTC): 2026-09-17T15:03:39Z
+Build finished (UTC): 2026-09-17T15:09:24Z
+
+Firmware:
+RT-BE92U_3006_102.9_Beta1-OPT1_nand_squashfs.pkgtb
+Size: 56,959,484 bytes
+SHA-256: 235892c89f65e78fe16e9d9539665b1fc98e271aac51e2380769aca336986d82
+
+Changes verified:
+- Firmware version suffix is Beta1-OPT1.
+- Client List wireless enrichment is included in httpd/web.o and the final httpd link.
+- BWDPI=n, DNSQUERY_INTERCEPT=n and ALEXA=n remain in the RT-BE92U profile.
+- gptfdisk uses the current bundled 1.0.9 source without the obsolete 2017 patch.
+- gptfdisk sgdisk cross-compiles successfully for ARM EABI5.
+- The active gptfdisk tree contains no .rej files.
+- The build log contains no Reversed/already-applied patch warning.
+
+The firmware was not flashed; UI behavior still needs validation on the actual RT-BE92U.
